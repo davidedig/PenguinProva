@@ -1,14 +1,31 @@
-﻿namespace ApocalypseSnow;
+﻿using System;
 
-[System.Flags]
-public enum StateList
+namespace ApocalypseSnow;
+
+/// <summary>
+/// Bitmask degli input del player.
+/// 
+/// Viene serializzato come int32 nel pacchetto MsgState.
+/// Permette di combinare più input usando OR bitwise.
+/// 
+/// Esempio:
+/// mask = Up | Left
+/// </summary>
+[Flags]
+public enum StateList : int
 {
     None = 0,
-    Up = 1 << 0,       // Sostituisce IsW
-    Down = 1 << 1,     // Sostituisce IsS
-    Left = 1 << 2,     // Sostituisce IsA
-    Right = 1 << 3,    // Sostituisce IsD
-    Reload = 1 << 4,   //  Sostituisce IsR
-    Shoot = 1 << 5,    // Sostituisce IsLeft
-    Moving = 1 << 6,    // Sostituisce IsMoving
+
+    // Movimento (WASD)
+    Up = 1 << 0,
+    Down = 1 << 1,
+    Left = 1 << 2,
+    Right = 1 << 3,
+
+    // Azioni
+    Reload = 1 << 4,
+    Shoot = 1 << 5,
+
+    // Stato derivato (opzionale)
+    Moving = 1 << 6
 }

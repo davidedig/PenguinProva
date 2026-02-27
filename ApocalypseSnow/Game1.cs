@@ -1,119 +1,148 @@
-﻿using System;
-using Microsoft.Xna.Framework;
+﻿using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
+using System;
 
 namespace ApocalypseSnow;
 
-public class Game1: Game
+/// <summary>
+/// Entry point principale del client MonoGame.
+/// 
+/// Responsabilità:
+/// - Configurare finestra e rendering.
+/// - Creare e gestire la GameSession (logica di gioco).
+/// - Disegnare background e HUD.
+/// - Delegare Update/Draw ai GameComponents registrati.
+/// 
+/// Non contiene logica di gameplay.
+/// La logica vive dentro GameSession e nei vari Component (Penguin, Ball, ecc.).
+/// </summary>
+public class Game1 : Game
 {
     private GraphicsDeviceManager _graphics;
-    private SpriteBatch _spriteBatch;
-    
-    // Dichiariamo il nostro pinguino qui!
-    private Penguin _myPenguin;
-    private Obstacle _obstacle;
-    private SpriteFont _uiFont;
-    private int _width;
-    private int _height;
-    private Texture2D _backgroundTexture;
-    
+
+    // Risorse grafiche principali
+    private Texture2D _backgroundTexture = null!;
+    private SpriteBatch _spriteBatch = null!;
+    private SpriteFont _uiFont = null!;
+
+    // Risoluzione finestra
+    private const int ScreenWidth = 640;
+    private const int ScreenHeight = 480;
+
+    // Percorsi contenuti
+    private const string ContentDirectory = "Content";
+    private const string BackgroundImagePath = ContentDirectory + "/images/environment.png";
+    private const string UiSpriteFont = "UIAmmo";
+
+    // Sessione di gioco attiva (contiene stato e logica)
+    private GameSession _currentSession = null!;
+
+    /// <summary>
+    /// Costruttore:
+    /// - Configura dimensioni finestra.
+    /// - Imposta directory contenuti.
+    /// </summary>
     public Game1()
     {
         _graphics = new GraphicsDeviceManager(this);
-        Content.RootDirectory = "Content";
-        _width = 0;
-        _height = 0;
+        _graphics.PreferredBackBufferWidth = ScreenWidth;
+        _graphics.PreferredBackBufferHeight = ScreenHeight;
+
+        Content.RootDirectory = ContentDirectory;
         IsMouseVisible = true;
     }
-    
+
+    /// <summary>
+    /// Fase di inizializzazione logica.
+    /// Qui creiamo la GameSession e colleghiamo gli eventi di spawn/despawn.
+    /// </summary>
     protected override void Initialize()
     {
-        // 1. Crea il pinguino qui
-        IAnimation animation = new AnimationManager();
-        IMovements movements = new MovementsManager();
-        CollisionManager collisionManager = new CollisionManager(this);
-        //CONNESSIONE ------------------------------------------------------
-        NetworkManager networkManager = new NetworkManager("127.0.0.1", 8080);
-        networkManager.Connect();
-        _myPenguin = new Penguin(this, new Vector2(100, 100), Vector2.Zero, animation, movements, networkManager);// <-MANCAVA ULTIMO PARAMETRO
-        
-        _obstacle = new Obstacle(this, new Vector2(100, 100), 1, 1);
+        _currentSession = new GameSession(this);
 
+        _currentSession.OnEntitySpawned += entity => Components.Add(entity);
+        _currentSession.OnEntityDestroyed += entity => Components.Remove(entity);
 
-        Console.ReadLine("Inserisci il tuo nome");
-        string playerName = Console.ReadLine();
-        JoinStruct joinStruct = new JoinStruct(playerName);
-        //networkManager.SendJoin(joinStruct);--------------------------------------------------------------------------
-    
-        
-        // 2. Aggiungilo ai componenti PRIMA di chiamare base.Initialize()
-        Components.Add(collisionManager);
-        Components.Add(_myPenguin);
-        Components.Add(_obstacle);
-       
+        Components.Add(_currentSession);
 
-        // 3. FONDAMENTALE: base.Initialize() chiamerà automaticamente 
-        // l'Initialize e il LoadContent di tutti i componenti in lista.
         base.Initialize();
+
+        _currentSession.Start();
     }
-    
+
+    /// <summary>
+    /// Caricamento delle risorse grafiche (texture, font).
+    /// Viene chiamato una sola volta all'avvio.
+    /// </summary>
     protected override void LoadContent()
     {
         _spriteBatch = new SpriteBatch(GraphicsDevice);
-        _uiFont = Content.Load<SpriteFont>("UIAmmo");
-        load_texture("Content/images/environment.png");
+        _uiFont = Content.Load<SpriteFont>(UiSpriteFont);
+
+        // Caricamento background da file
+        using var stream = System.IO.File.OpenRead(BackgroundImagePath);
+        _backgroundTexture = Texture2D.FromStream(GraphicsDevice, stream);
+
         base.LoadContent();
     }
-    
-    private void load_texture(string path)
-    {
-        using var stream = System.IO.File.OpenRead(path);
-        // 1. Carichiamo l'immagine (deve essere nel Content Pipeline)
-        this._backgroundTexture = Texture2D.FromStream(GraphicsDevice, stream);
-    }
-    
-    protected override void Draw(GameTime gameTime)
-    {
-        // 1. Pulisce lo schermo (il "famoso" azzurro CornflowerBlue)
-        GraphicsDevice.Clear(Color.White);
 
-        // 2. Inizia la coda di disegno
-        _spriteBatch.Begin();
-
-        _spriteBatch.Draw(_backgroundTexture, new Rectangle(0, 0, GraphicsDevice.Viewport.Width, GraphicsDevice.Viewport.Height), Color.White);
-        // 3. Chiama il disegno del pinguino
-        if (_myPenguin != null)
-        {
-            
-            _myPenguin.Draw(_spriteBatch);
-            // Disegno della UI (Munizioni)
-            string ammoText = $"Munizioni: {_myPenguin.Ammo}";
-            // Posizioniamo il testo in alto a sinistra (10, 10)
-            _spriteBatch.DrawString(_uiFont, ammoText, new Vector2(_width/10f, (_height/1.2f)), Color.Black);
-        }
-
-        foreach (var component in Components)
-        {
-            if (component is Ball ball)
-            {
-                ball.Draw(_spriteBatch);
-            }
-            else if (component is Obstacle obstacle)
-            {
-                obstacle.Draw(_spriteBatch);
-            }
-        }
-
-        // 4. Invia tutto alla scheda video
-        _spriteBatch.End();
-
-        base.Draw(gameTime);
-    }
-    
+    /// <summary>
+    /// Update globale del gioco.
+    /// Non contiene logica diretta:
+    /// delega tutto ai GameComponent registrati (Penguin, Ball, ecc.).
+    /// </summary>
     protected override void Update(GameTime gameTime)
     {
-        _width = GraphicsDevice.Viewport.Width;
-        _height = GraphicsDevice.Viewport.Height;
         base.Update(gameTime);
+    }
+
+    /// <summary>
+    /// Pipeline di rendering:
+    /// 1) Pulizia schermo
+    /// 2) Disegno background
+    /// 3) Disegno GameComponents (base.Draw)
+    /// 4) Disegno HUD sopra tutto
+    /// </summary>
+    protected override void Draw(GameTime gameTime)
+    {
+        GraphicsDevice.Clear(Color.White);
+
+        // --- BACKGROUND ---
+        _spriteBatch.Begin();
+        _spriteBatch.Draw(
+            _backgroundTexture,
+            new Rectangle(0, 0, GraphicsDevice.Viewport.Width, GraphicsDevice.Viewport.Height),
+            Color.White
+        );
+        _spriteBatch.End();
+
+        // --- ENTITÀ DI GIOCO ---
+        // Disegna tutti i DrawableGameComponents registrati
+        base.Draw(gameTime);
+
+        // --- HUD ---
+        _spriteBatch.Begin();
+
+        string ammoText = $"Munizioni: {_currentSession.LocalPlayerAmmo}";
+        _spriteBatch.DrawString(
+            _uiFont,
+            ammoText,
+            new Vector2(GraphicsDevice.Viewport.Width / 10f, GraphicsDevice.Viewport.Height / 1.2f),
+            Color.Black
+        );
+
+        _spriteBatch.End();
+    }
+
+    /// <summary>
+    /// Pulizia risorse.
+    /// Viene chiamato alla chiusura del gioco.
+    /// </summary>
+    protected override void UnloadContent()
+    {
+        _currentSession?.Dispose();
+        _backgroundTexture?.Dispose();
+        _spriteBatch?.Dispose();
+        base.UnloadContent();
     }
 }

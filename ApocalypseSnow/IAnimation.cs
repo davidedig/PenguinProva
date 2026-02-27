@@ -3,6 +3,7 @@ using Microsoft.Xna.Framework.Graphics;
 
 namespace ApocalypseSnow;
 
+// mi pare che non la uso più
 public interface IAnimation
 {
     Texture2D Texture { get; set; }

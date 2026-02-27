@@ -1,11 +1,11 @@
-﻿using System;
-using System.Runtime.InteropServices;
-using Microsoft.Xna.Framework;
+﻿using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
+using System;
+using System.Runtime.InteropServices;
 
 namespace ApocalypseSnow;
 
-public class Ball:DrawableGameComponent
+public class Ball: DrawableGameComponent
 {
     private Texture2D _texture;
     private string _tag;
@@ -20,8 +20,8 @@ public class Ball:DrawableGameComponent
     private static readonly float K = 0.0003f;   // velocità di crescita
     private int _halfTextureFractionWidth;
     private int _halfTextureFractionHeight;
-    
 
+    private SpriteBatch _spriteBatch;
     public Ball(Game game, Vector2 startPosition, Vector2 startSpeed, Vector2 finalPosition, string tag) : base(game)
     {
         this._startPosition = startPosition;
@@ -93,6 +93,7 @@ public class Ball:DrawableGameComponent
     
     protected override void LoadContent()
     {
+        _spriteBatch = new SpriteBatch(GraphicsDevice);
         load_texture("Content/images/palla1.png");
         CollisionManager.Instance.addObject(_tag, _position.X, _position.Y, _texture.Width, _texture.Height );
         _halfTextureFractionWidth  = _texture.Width / 2;
@@ -100,13 +101,28 @@ public class Ball:DrawableGameComponent
     }
 
 
-    public void Draw(SpriteBatch spriteBatch)
+    /* public void Draw(SpriteBatch spriteBatch)
+     {
+         spriteBatch.Draw(_texture, _position,null, Color.White, 0f, 
+             Vector2.Zero, 
+             _scale, 
+             SpriteEffects.None, 
+             0f);
+     }
+
+     */
+
+    public override void Draw(GameTime gameTime)
     {
-        spriteBatch.Draw(_texture, _position,null, Color.White, 0f, 
-            Vector2.Zero, 
-            _scale, 
-            SpriteEffects.None, 
+        _spriteBatch.Begin();
+
+        _spriteBatch.Draw(_texture, _position, null, Color.White, 0f,
+            Vector2.Zero,
+            _scale,
+            SpriteEffects.None,
             0f);
+
+        _spriteBatch.End();
     }
 
     public override void Update(GameTime gameTime)

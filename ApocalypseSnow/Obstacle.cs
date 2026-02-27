@@ -1,5 +1,6 @@
 ﻿using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
+using SharpDX.Direct2D1.Effects;
 
 namespace ApocalypseSnow;
 
@@ -15,8 +16,9 @@ public class Obstacle:DrawableGameComponent
     private int _textureFractionHeight;
     private int _halfTextureFractionWidth;
     private int _halfTextureFractionHeight;
-    
-    
+
+    private SpriteBatch _spriteBatch;
+
     public Obstacle(Game game, Vector2 position, int posX, int posY) : base(game)
     {
         _position = position;
@@ -42,6 +44,7 @@ public class Obstacle:DrawableGameComponent
 
     protected override void LoadContent()
     {
+        _spriteBatch = new SpriteBatch(GraphicsDevice);
         //Vector2 position = GetPosition(_posX,  _posY);
         load_texture(GraphicsDevice, "Content/images/ostacoli1.png");
         Vector2 position = GetPosition(_posX,  _posY);
@@ -55,9 +58,12 @@ public class Obstacle:DrawableGameComponent
         CollisionManager.Instance.addObject(_tag, posCollX, posCollY, _textureFractionWidth, _textureFractionHeight);
     }
 
-    public void Draw(SpriteBatch spriteBatch)
+    public override void Draw(GameTime gameTime)
     {
-        
-        spriteBatch.Draw(_texture, _position, _sourceRect, Color.White);
+        _spriteBatch.Begin();
+
+        _spriteBatch.Draw(_texture, _position, _sourceRect, Color.White);
+
+        _spriteBatch.End();
     }
 }
