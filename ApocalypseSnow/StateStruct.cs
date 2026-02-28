@@ -2,15 +2,8 @@
 
 public struct StateStruct
 {
-    //public MessageType Type;
     public StateList Current;
     public StateList Old;
-
-
-    public StateStruct()
-    {
-        //Type = MessageType.State;
-    }
 
     public void Update()
     {

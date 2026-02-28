@@ -19,12 +19,12 @@ import (
 
 const (
 	MsgState       = 1 // 9B  [type][mask:int32][seq:uint32]
-	MsgShot        = 2 // 13B [type][a:int32][b:int32][charge:int32]  (EVENT: release)
+	MsgShot        = 2 // 13B [type][dirX:float32][dirY:float32][charge:float32]
 	MsgJoin        = 3 // 9B  [type][0][0]
-	MsgAuthState   = 4 // 13B [type][ack:uint32][x:float32][y:float32]                 (SELF)
+	MsgAuthState   = 4 // 13B [type][ack:uint32][x:float32][y:float32]
 	MsgJoinAck     = 5 // 13B [type][playerId:uint32][spawnX:float32][spawnY:float32]
-	MsgRemoteState = 6 // 13B [type][x:float32][y:float32][mask:int32]                (OTHER)
-	MsgRemoteShot  = 7 // 13B [type][a:int32][b:int32][charge:int32]                  (OTHER)
+	MsgRemoteState = 6 // 13B [type][x:float32][y:float32][mask:int32]
+	MsgRemoteShot  = 7 // 13B [type][dirX:float32][dirY:float32][charge:float32]
 )
 
 const (
@@ -37,20 +37,22 @@ const (
 )
 
 const (
-	MoveHz    float32 = 30.0
-	MoveDt    float32 = 1.0 / MoveHz
-	MoveSpeed float32 = 200.0
+	MoveHz     float32 = 30.0
+	MoveDt     float32 = 1.0 / MoveHz
+	MoveSpeed  float32 = 200.0
+	ListenAddr         = ":8080"
+)
 
-	ListenAddr = ":8080"
-
-	chargeCap int32 = 500
+const (
+	chargeCap         float32 = 500.0
+	maxCatchupPerTick         = 8 // ? max step per tick per client (evita warp se backlog enorme)
 )
 
 type Client struct {
 	conn  net.Conn
 	send  chan []byte
-	input chan StateMsg // latest-wins
-	shot  chan ShotMsg  // latest-wins (release event)
+	input chan StateMsg // bounded buffer
+	shot  chan ShotMsg  // bounded buffer (release event)
 	done  chan struct{}
 	id    uint32
 	slot  int
@@ -62,9 +64,9 @@ type StateMsg struct {
 }
 
 type ShotMsg struct {
-	a      int32
-	b      int32
-	charge int32
+	dirX   float32
+	dirY   float32
+	charge float32
 }
 
 type Session struct {
@@ -84,9 +86,7 @@ type Session struct {
 
 var globalID uint32 = 0
 
-func nextID() uint32 {
-	return atomic.AddUint32(&globalID, 1)
-}
+func nextID() uint32 { return atomic.AddUint32(&globalID, 1) }
 
 func sanitizeMask(m int32) int32 {
 	if (m&Left) != 0 && (m&Right) != 0 {
@@ -162,8 +162,7 @@ func sendRemoteState(c *Client, x, y float32, mask int32) {
 	trySend(c, buf, false)
 }
 
-func sendRemoteShot(c *Client, a, b, charge int32) {
-	// clamp minimo (per robustezza)
+func sendRemoteShot(c *Client, dx, dy, charge float32) {
 	if charge < 0 {
 		charge = 0
 	}
@@ -173,9 +172,9 @@ func sendRemoteShot(c *Client, a, b, charge int32) {
 
 	buf := make([]byte, 13)
 	buf[0] = MsgRemoteShot
-	binary.LittleEndian.PutUint32(buf[1:5], uint32(a))
-	binary.LittleEndian.PutUint32(buf[5:9], uint32(b))
-	binary.LittleEndian.PutUint32(buf[9:13], uint32(charge))
+	binary.LittleEndian.PutUint32(buf[1:5], math.Float32bits(dx))
+	binary.LittleEndian.PutUint32(buf[5:9], math.Float32bits(dy))
+	binary.LittleEndian.PutUint32(buf[9:13], math.Float32bits(charge))
 	trySend(c, buf, false)
 }
 
@@ -225,7 +224,6 @@ func readExactly(conn net.Conn, n int) ([]byte, error) {
 
 func readerLoop(c *Client) {
 	defer closeClient(c)
-
 	for {
 		h, err := readExactly(c.conn, 1)
 		if err != nil {
@@ -250,6 +248,7 @@ func readerLoop(c *Client) {
 
 			msg := StateMsg{mask: mask, seq: seq}
 
+			// bounded buffer, non bloccare mai
 			select {
 			case c.input <- msg:
 			default:
@@ -258,16 +257,15 @@ func readerLoop(c *Client) {
 			}
 
 		case MsgShot:
-			// 12 bytes: [a][b][charge]  (EVENT: release)
 			pl, err := readExactly(c.conn, 12)
 			if err != nil {
 				return
 			}
-			a := int32(binary.LittleEndian.Uint32(pl[0:4]))
-			b := int32(binary.LittleEndian.Uint32(pl[4:8]))
-			ch := int32(binary.LittleEndian.Uint32(pl[8:12]))
+			dx := math.Float32frombits(binary.LittleEndian.Uint32(pl[0:4]))
+			dy := math.Float32frombits(binary.LittleEndian.Uint32(pl[4:8]))
+			ch := math.Float32frombits(binary.LittleEndian.Uint32(pl[8:12]))
 
-			msg := ShotMsg{a: a, b: b, charge: ch}
+			msg := ShotMsg{dirX: dx, dirY: dy, charge: ch}
 
 			select {
 			case c.shot <- msg:
@@ -283,27 +281,20 @@ func readerLoop(c *Client) {
 	}
 }
 
-// ============== MATCHMAKER ==============
-
 func matchmaker(join <-chan *Client) {
 	var waiting *Client
-
 	for c := range join {
 		if waiting == nil {
 			waiting = c
 			continue
 		}
-
 		a := waiting
 		b := c
 		waiting = nil
-
 		s := newSession(a, b)
 		go s.run()
 	}
 }
-
-// ============== SESSION ==============
 
 func newSession(a, b *Client) *Session {
 	s := &Session{
@@ -311,16 +302,31 @@ func newSession(a, b *Client) *Session {
 		b:    b,
 		tick: time.NewTicker(time.Second / time.Duration(MoveHz)),
 	}
-
 	s.ax, s.ay = 400, 500
 	s.bx, s.by = 400, 100
-
-	a.id = nextID()
-	b.id = nextID()
-	a.slot = 0
-	b.slot = 1
-
+	a.id, b.id = nextID(), nextID()
+	a.slot, b.slot = 0, 1
 	return s
+}
+
+// ? KEY FIX: consuma TUTTI i pacchetti State disponibili e fa 1 step DLL per ciascuno.
+// Ritorna (stepsSimulati, x,y, curMask, curAck)
+func processClientTicks(c *Client, x, y float32, curMask int32, curAck uint32) (int, float32, float32, int32, uint32) {
+	steps := 0
+	for {
+		select {
+		case m := <-c.input:
+			curMask = m.mask
+			curAck = m.seq
+			x, y = stepFromStateDLL(x, y, curMask)
+			steps++
+			if steps >= maxCatchupPerTick {
+				return steps, x, y, curMask, curAck
+			}
+		default:
+			return steps, x, y, curMask, curAck
+		}
+	}
 }
 
 func (s *Session) run() {
@@ -340,35 +346,28 @@ func (s *Session) run() {
 			return
 		case <-s.b.done:
 			return
-
 		case <-s.tick.C:
-			s.aMask, s.aAck = drainState(s.a, s.aMask, s.aAck)
-			s.bMask, s.bAck = drainState(s.b, s.bMask, s.bAck)
+	// ? SOLO input-driven: 1 seq = 1 step
+	_, s.ax, s.ay, s.aMask, s.aAck = processClientTicks(s.a, s.ax, s.ay, s.aMask, s.aAck)
+	_, s.bx, s.by, s.bMask, s.bAck = processClientTicks(s.b, s.bx, s.by, s.bMask, s.bAck)
 
-			// movimento autoritativo
-			s.ax, s.ay = stepFromStateDLL(s.ax, s.ay, s.aMask)
-			s.bx, s.by = stepFromStateDLL(s.bx, s.by, s.bMask)
+	sendAuthStateSelf(s.a, s.aAck, s.ax, s.ay)
+	sendRemoteState(s.a, s.bx, s.by, s.bMask)
+	sendAuthStateSelf(s.b, s.bAck, s.bx, s.by)
+	sendRemoteState(s.b, s.ax, s.ay, s.aMask)
 
-			// SELF auth + OTHER state
-			sendAuthStateSelf(s.a, s.aAck, s.ax, s.ay)
-			sendRemoteState(s.a, s.bx, s.by, s.bMask)
-
-			sendAuthStateSelf(s.b, s.bAck, s.bx, s.by)
-			sendRemoteState(s.b, s.ax, s.ay, s.aMask)
-
-			// forward shot events (release) subito
-			forwardShots(s.a, s.b)
-			forwardShots(s.b, s.a)
+	forwardShots(s.a, s.b)
+	forwardShots(s.b, s.a)
 		}
 	}
 }
 
+// (non usata col fix, la lascio solo per riferimento)
 func drainState(c *Client, curMask int32, curAck uint32) (int32, uint32) {
 	for {
 		select {
 		case m := <-c.input:
-			curMask = m.mask
-			curAck = m.seq
+			curMask, curAck = m.mask, m.seq
 		default:
 			return curMask, curAck
 		}
@@ -379,14 +378,12 @@ func forwardShots(from, to *Client) {
 	for {
 		select {
 		case sh := <-from.shot:
-			sendRemoteShot(to, sh.a, sh.b, sh.charge)
+			sendRemoteShot(to, sh.dirX, sh.dirY, sh.charge)
 		default:
 			return
 		}
 	}
 }
-
-// ============== MAIN ==============
 
 func main() {
 	ln, err := net.Listen("tcp", ListenAddr)
@@ -396,7 +393,6 @@ func main() {
 	defer ln.Close()
 
 	fmt.Println("Server listening on", ListenAddr)
-
 	join := make(chan *Client, 128)
 	go matchmaker(join)
 
@@ -412,16 +408,14 @@ func main() {
 		c := &Client{
 			conn:  conn,
 			send:  make(chan []byte, 256),
-			input: make(chan StateMsg, 8),
+			input: make(chan StateMsg, 64),
 			shot:  make(chan ShotMsg, 8),
 			done:  make(chan struct{}),
 		}
 
 		fmt.Println("[ACCEPT]", conn.RemoteAddr())
-
 		go writerLoop(c)
 		go readerLoop(c)
-
 		join <- c
 	}
 }

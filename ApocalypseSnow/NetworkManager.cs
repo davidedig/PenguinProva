@@ -36,13 +36,12 @@ public sealed class NetworkManager : IDisposable
         }
     }
 
-    public event Action<uint, float, float>? OnAuthState;                 // ack,x,y
-    public event Action<uint, float, float>? OnJoinAck;                   // pid,sx,sy
+    public event Action<uint, float, float>? OnAuthState;                // ack,x,y
+    public event Action<uint, float, float>? OnJoinAck;                  // pid,sx,sy
     public event Action<float, float, StateList>? OnRemoteState;          // x,y,mask
 
-    // RemoteShot: due int32 + charge int32.
-    // NOTA: per il fix tiro, questi due int32 lato rete possono essere interpretati come dx/dy (offset) e non screen mouse assoluto.
-    public event Action<int, int, int>? OnRemoteShot;                     // a,b,charge
+    // AGGIORNATO: Ora riceve 3 float (dx, dy normalizzati e charge)
+    public event Action<float, float, float>? OnRemoteShot;              // dx,dy,charge
 
     public bool IsConnected { get; private set; }
     public string? LastError { get; private set; }
@@ -159,8 +158,7 @@ public sealed class NetworkManager : IDisposable
         }
     }
 
-    /// MsgShot 13B: [type][a:int32][b:int32][charge:int32]
-    /// (a,b) = per ora sono i due int che decidiamo noi (mouse assoluto oppure dx/dy offset, ecc.)
+    /// MsgShot 13B: [type:1B][dirX:float4B][dirY:float4B][charge:float4B]
     public void SendShot(ShotStruct shot)
     {
         if (!IsConnected || _stream == null || _tcpClient?.Connected != true)
@@ -169,14 +167,15 @@ public sealed class NetworkManager : IDisposable
         byte[] packet = new byte[13];
         packet[0] = (byte)MessageType.Shot;
 
-        Buffer.BlockCopy(BitConverter.GetBytes(shot.mouseX), 0, packet, 1, 4);
-        Buffer.BlockCopy(BitConverter.GetBytes(shot.mouseY), 0, packet, 5, 4);
+        // Usiamo i float della ShotStruct normalizzata
+        Buffer.BlockCopy(BitConverter.GetBytes(shot.dirX), 0, packet, 1, 4);
+        Buffer.BlockCopy(BitConverter.GetBytes(shot.dirY), 0, packet, 5, 4);
         Buffer.BlockCopy(BitConverter.GetBytes(shot.charge), 0, packet, 9, 4);
 
         try
         {
             lock (_sendLock) { _stream.Write(packet, 0, packet.Length); }
-            Log1Hz(ref _lastSendLog, $"[NET SEND] SHOT a={shot.mouseX} b={shot.mouseY} ch={shot.charge}");
+            Log1Hz(ref _lastSendLog, $"[NET SEND] SHOT dir=({shot.dirX:F2},{shot.dirY:F2}) charge={shot.charge:F1}");
         }
         catch (Exception ex)
         {
@@ -213,7 +212,6 @@ public sealed class NetworkManager : IDisposable
                 if (type == (byte)MessageType.AuthState)
                 {
                     await ReadExactlyAsync(s, payload12, 12, ct);
-
                     uint ack = BitConverter.ToUInt32(payload12, 0);
                     float x = BitConverter.ToSingle(payload12, 4);
                     float y = BitConverter.ToSingle(payload12, 8);
@@ -224,7 +222,6 @@ public sealed class NetworkManager : IDisposable
                 else if (type == (byte)MessageType.JoinAck)
                 {
                     await ReadExactlyAsync(s, payload12, 12, ct);
-
                     uint playerId = BitConverter.ToUInt32(payload12, 0);
                     float sx = BitConverter.ToSingle(payload12, 4);
                     float sy = BitConverter.ToSingle(payload12, 8);
@@ -235,7 +232,6 @@ public sealed class NetworkManager : IDisposable
                 else if (type == (byte)MessageType.RemoteState)
                 {
                     await ReadExactlyAsync(s, payload12, 12, ct);
-
                     float x = BitConverter.ToSingle(payload12, 0);
                     float y = BitConverter.ToSingle(payload12, 4);
                     int maskInt = BitConverter.ToInt32(payload12, 8);
@@ -247,12 +243,13 @@ public sealed class NetworkManager : IDisposable
                 {
                     await ReadExactlyAsync(s, payload12, 12, ct);
 
-                    int a = BitConverter.ToInt32(payload12, 0);
-                    int b = BitConverter.ToInt32(payload12, 4);
-                    int chargeInt = BitConverter.ToInt32(payload12, 8);
+                    // LEGGERE COME FLOAT (Single)
+                    float dx = BitConverter.ToSingle(payload12, 0);
+                    float dy = BitConverter.ToSingle(payload12, 4);
+                    float ch = BitConverter.ToSingle(payload12, 8);
 
-                    Log1Hz(ref _lastRecvLog, $"[NET RECV] RemoteShot a={a} b={b} ch={chargeInt}");
-                    OnRemoteShot?.Invoke(a, b, chargeInt);
+                    Log1Hz(ref _lastRecvLog, $"[NET RECV] RemoteShot dx={dx:F2} dy={dy:F2} ch={ch:F1}");
+                    OnRemoteShot?.Invoke(dx, dy, ch);
                 }
                 else
                 {

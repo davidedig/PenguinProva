@@ -58,35 +58,35 @@ public sealed class Reconciler
         if (!_hasAuth) return;
         _hasAuth = false;
 
-        // Sempre: drop input già confermati (così non cresce all’infinito)
+        // Scarta gli input vecchi che il server ha già processato e confermato
         _pending.RemoveAll(p => p.Seq <= _ack);
 
-        // Tunabili (pixel)
-        const float Eps = 0.75f;          // sotto questo, ignora (nessuna correzione)
-        const float SnapThreshold = 12f;  // sopra questo, snap + replay
-        const float SoftLerp = 0.35f;     // quanto “tirare” verso serverPos quando errore medio
-
-        float err = Vector2.Distance(pos, _authPos);
-
-        if (err <= Eps)
+        // 1. Calcola il "Vero Presente": parti dal passato sicuro (_authPos) 
+        // e ri-simula tutti i movimenti che il server non ha ancora visto.
+        Vector2 replayPos = _authPos;
+        foreach (var p in _pending)
         {
-            // praticamente uguale
-            return;
+            replayPos = PhysicsWrapper.StepFromState(replayPos, p.MoveMask, moveSpeed, moveDt);
         }
+
+        // 2. IL FIX: Confronta la tua posizione attuale (pos) con il "Vero Presente" (replayPos)
+        float err = Vector2.Distance(pos, replayPos);
+
+        const float Eps = 0.75f;
+        const float SnapThreshold = 12f;
+        const float SoftLerp = 0.35f;
+
+        // Se hai predetto bene, l'errore è 0. Il Reconciler non tocca il pinguino!
+        if (err <= Eps) return;
 
         if (err <= SnapThreshold)
         {
-            // correzione morbida, niente replay (evita micro-teleport)
-            pos = Vector2.Lerp(pos, _authPos, SoftLerp);
+            // Piccolo errore (es. float drift), correzione invisibile
+            pos = Vector2.Lerp(pos, replayPos, SoftLerp);
             return;
         }
 
-        // errore grande: snap + replay
-        Vector2 replayPos = _authPos;
-
-        foreach (var p in _pending)
-            replayPos = PhysicsWrapper.StepFromState(replayPos, p.MoveMask, moveSpeed, moveDt);
-
+        // Errore grave (es. il server ti ha visto sbattere contro un muro)
         pos = replayPos;
     }
 }

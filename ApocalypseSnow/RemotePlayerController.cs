@@ -5,18 +5,27 @@ namespace ApocalypseSnow;
 
 public sealed class RemotePlayerController : IPlayerController
 {
-    private StateStruct _cached;
+    private StateStruct _state;
 
-    // per shot: qui NON è mouse assoluto, è offset dx/dy
-    private Vector2 _cachedAimOffset;
-    private float _cachedCharge;
+    // shot data
+    private Vector2 _receivedOffset;
+    private float _receivedCharge;
 
+    // pending input state from network
     private StateList _pendingMask;
     private int _hasPendingMask;
 
-    private Vector2 _pendingAimOffset;
+    // pending shot from network
+    private Vector2 _pendingOffset;
     private float _pendingShotCharge;
     private int _hasPendingShot;
+
+    // pending position snapshot from network
+    private Vector2 _pendingPos;
+    private int _hasPendingPos;
+
+    public Vector2 ShootOffset => _receivedOffset;
+    public float ShotCharge => _receivedCharge;
 
     public void ApplyRemoteState(StateList mask)
     {
@@ -24,39 +33,52 @@ public sealed class RemotePlayerController : IPlayerController
         Interlocked.Exchange(ref _hasPendingMask, 1);
     }
 
-    // a,b = dx,dy (offset)
-    public void ApplyRemoteShot(int a, int b, float charge)
+    public void ApplyRemoteShot(float x, float y, float charge)
     {
-        _pendingAimOffset = new Vector2(a, b);
+        _pendingOffset = new Vector2(x, y);
         _pendingShotCharge = charge;
         Interlocked.Exchange(ref _hasPendingShot, 1);
     }
 
-    // Ritorna OFFSET (dx,dy)
-    public Vector2 GetMousePosition() => _cachedAimOffset;
-
-    public float GetShotCharge() => _cachedCharge;
-
-    public void UpdateInput(ref StateStruct inputList)
+    public void ApplyRemotePosition(Vector2 pos)
     {
-        _cached.Old = _cached.Current;
+        _pendingPos = pos;
+        Interlocked.Exchange(ref _hasPendingPos, 1);
+    }
+
+    public void UpdateInput(ref StateStruct state)
+    {
+        _state.Old = _state.Current;
 
         if (Interlocked.Exchange(ref _hasPendingMask, 0) == 1)
         {
-            _cached.Current = _pendingMask;
+            _state.Current = _pendingMask;
         }
 
         if (Interlocked.Exchange(ref _hasPendingShot, 0) == 1)
         {
-            _cachedAimOffset = _pendingAimOffset;
-            _cachedCharge = _pendingShotCharge;
+            _receivedOffset = _pendingOffset;
+            _receivedCharge = _pendingShotCharge;
 
-            // forza release-edge nel frame dello shot-event
-            _cached.Old |= StateList.Shoot;
-            _cached.Current &= ~StateList.Shoot;
+            // one-tick shoot pulse (JustReleased on the Penguin side)
+            _state.Old |= StateList.Shoot;
+            _state.Current &= ~StateList.Shoot;
         }
 
-        inputList.Old = _cached.Old;
-        inputList.Current = _cached.Current;
+        state.Old = _state.Old;
+        state.Current = _state.Current;
+    }
+
+    public void UpdatePosition(ref Vector2 position, float dt, in StateStruct state)
+    {
+        // snapshot-driven: apply last received position
+        if (Interlocked.Exchange(ref _hasPendingPos, 0) == 1)
+        {
+            position = _pendingPos;
+        }
+
+        // If you later want smoothing:
+        // position = Vector2.Lerp(position, _pendingPos, 0.25f);
+        // (but then do not reset _hasPendingPos to 0 immediately)
     }
 }

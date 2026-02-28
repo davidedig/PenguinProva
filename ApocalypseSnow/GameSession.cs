@@ -1,30 +1,34 @@
-using System;
 using Microsoft.Xna.Framework;
+using System;
+using System.Collections.Concurrent;
 
 namespace ApocalypseSnow;
+
+public record struct JoinSnapshot(uint PlayerId, Vector2 SpawnPos);
+public record struct AuthSnapshot(uint Ack, Vector2 Position);
+public record struct RemoteSnapshot(Vector2 Position, StateList Mask);
 
 public sealed class GameSession : GameComponent, IDisposable
 {
     public event Action<IGameComponent>? OnEntitySpawned;
     public event Action<IGameComponent>? OnEntityDestroyed;
 
-    private const string ServerAddr = "127.0.0.1";
-    private const int ServerPort = 8080;
+    private const string ServerAddr = "4.tcp.eu.ngrok.io";
+    private const int ServerPort = 10083;
 
     private const float NetHz = 30f;
     private const float NetDt = 1f / NetHz;
-
     private const float MoveSpeed = 200f;
 
     private readonly NetworkManager _networkManager;
     private readonly CollisionManager _collisionManager;
-    private readonly AnimationManager _animationManager;
+    private readonly AnimationManager _localAnimationManager;
     private readonly AnimationManager _remoteAnimationManager;
 
     private readonly LocalPlayerController _localController;
     private readonly RemotePlayerController _remoteController;
 
-    private readonly Reconciler _reconciler = new Reconciler();
+    private readonly Reconciler _reconciler = new();
 
     private NewPenguin? _localPenguin;
     private NewPenguin? _remotePenguin;
@@ -34,91 +38,39 @@ public sealed class GameSession : GameComponent, IDisposable
     private bool _spawned;
     private uint _playerId;
 
-    private float _netAcc;
     private long _frameId;
+    private StateStruct _frameInput = new();
 
-    private StateStruct _frameInput;
+    // hard 30Hz scheduler for sending input
+    private bool _netInit;
+    private double _nextNetTickSec;
+
+    private readonly ConcurrentQueue<JoinSnapshot> _joinQueue = new();
+    private readonly ConcurrentQueue<AuthSnapshot> _authQueue = new();
+    private readonly ConcurrentQueue<RemoteSnapshot> _remoteStateQueue = new();
+    private readonly ConcurrentQueue<ShotStruct> _shotQueue = new();
 
     public int LocalPlayerAmmo => _localPenguin?.Ammo ?? 0;
     public bool IsConnected => _networkManager.IsConnected;
     public uint PlayerId => _playerId;
 
-    // ===== thread-safe buffers =====
-    private readonly object _joinLock = new();
-    private bool _pendingJoin;
-    private uint _pendingPlayerId;
-    private Vector2 _pendingSpawn;
-
-    private readonly object _authLock = new();
-    private bool _pendingAuth;
-    private uint _pendingAck;
-    private Vector2 _pendingAuthPos;
-
-    private readonly object _remoteLock = new();
-    private bool _pendingRemote;
-    private Vector2 _pendingRemotePos;
-    private StateList _pendingRemoteMask;
-
-    private readonly object _shotLock = new();
-    private bool _pendingRemoteShot;
-    private int _pendingShotA;       // dx
-    private int _pendingShotB;       // dy
-    private float _pendingShotCharge;
-
     public GameSession(Game gameContext) : base(gameContext)
     {
+        UpdateOrder = -1000;
+
         _networkManager = new NetworkManager(ServerAddr, ServerPort);
         _collisionManager = new CollisionManager(gameContext);
 
-        _animationManager = new AnimationManager("blue");
+        _localAnimationManager = new AnimationManager("blue");
         _remoteAnimationManager = new AnimationManager("red");
 
         _localController = new LocalPlayerController();
         _remoteController = new RemotePlayerController();
 
-        _frameInput = new StateStruct();
-
-        _networkManager.OnJoinAck += (pid, x, y) =>
-        {
-            lock (_joinLock)
-            {
-                _pendingJoin = true;
-                _pendingPlayerId = pid;
-                _pendingSpawn = new Vector2(x, y);
-            }
-        };
-
-        _networkManager.OnAuthState += (ack, x, y) =>
-        {
-            lock (_authLock)
-            {
-                _pendingAuth = true;
-                _pendingAck = ack;
-                _pendingAuthPos = new Vector2(x, y);
-            }
-        };
-
-        _networkManager.OnRemoteState += (x, y, mask) =>
-        {
-            lock (_remoteLock)
-            {
-                _pendingRemote = true;
-                _pendingRemotePos = new Vector2(x, y);
-                _pendingRemoteMask = mask;
-            }
-        };
-
-        // RemoteShot: (a,b,charge) dove a,b sono dx/dy (offset aim) nel nostro schema
-        _networkManager.OnRemoteShot += (a, b, charge) =>
-        {
-            lock (_shotLock)
-            {
-                _pendingRemoteShot = true;
-                _pendingShotA = a;
-                _pendingShotB = b;
-                _pendingShotCharge = charge;
-            }
-        };
+        _networkManager.OnJoinAck += (pid, x, y) => _joinQueue.Enqueue(new JoinSnapshot(pid, new Vector2(x, y)));
+        _networkManager.OnAuthState += (ack, x, y) => _authQueue.Enqueue(new AuthSnapshot(ack, new Vector2(x, y)));
+        _networkManager.OnRemoteState += (x, y, mask) => _remoteStateQueue.Enqueue(new RemoteSnapshot(new Vector2(x, y), mask));
+        _networkManager.OnRemoteShot += (dx, dy, charge) => _shotQueue.Enqueue(new ShotStruct(dx, dy, charge));
     }
 
     public void Start()
@@ -130,87 +82,91 @@ public sealed class GameSession : GameComponent, IDisposable
     public override void Update(GameTime gameTime)
     {
         float dt = (float)gameTime.ElapsedGameTime.TotalSeconds;
+        double nowSec = gameTime.TotalGameTime.TotalSeconds;
 
-        // ===== 0) snapshot input (UNA volta) =====
+        ProcessServerMessages();
+        UpdateLocalInput(dt);
+        SendInputToServer(nowSec);
+
+        base.Update(gameTime);
+    }
+
+    private void ProcessServerMessages()
+    {
+        GetAll(_joinQueue, join =>
+        {
+            if (!_spawned) HandleSpawn(join);
+        });
+
+        // reconcile only on auth
+        GetLatest(_authQueue, auth =>
+        {
+            _reconciler.OnServerAuth(auth.Ack, auth.Position);
+
+            if (_spawned && _localPenguin != null)
+            {
+                Vector2 p = _localPenguin.Position;
+                _reconciler.Apply(ref p, MoveSpeed, NetDt);
+                _localPenguin.Position = p;
+            }
+        });
+
+        GetLatest(_remoteStateQueue, HandleRemoteUpdate);
+
+        GetAll(_shotQueue, shot =>
+        {
+            _remoteController.ApplyRemoteShot(shot.dirX, shot.dirY, shot.charge);
+        });
+    }
+
+    private void UpdateLocalInput(float dt)
+    {
         _frameId++;
+
+        // aim offset belongs to controller
+        if (_localPenguin != null)
+            _localController.OwnerCenter = _localPenguin.Center;
+
         _localController.BeginFrame(_frameId, dt, Game.IsActive);
         _localController.UpdateInput(ref _frameInput);
 
-        // ===== 1) handshake join =====
         if (_networkManager.IsConnected && !_joinSent)
         {
             _networkManager.SendJoin();
             _joinSent = true;
         }
-
-        // ===== 2) spawn locale su JoinAck =====
-        TryConsumeJoinAckAndSpawn();
-
-        // ===== 3) remoto: state/move/anim =====
-        TryConsumeRemoteAndSpawnOrMove();
-
-        // ===== 4) remoto: evento shot (dx/dy + charge) =====
-        TryConsumeRemoteShotAndFeedController();
-
-        if (_spawned && _localPenguin != null)
-        {
-            // ===== 5) auth -> reconciler =====
-            TryConsumeAuthAndFeedReconciler();
-
-            // ===== 6) tick rete 30Hz =====
-            _netAcc += dt;
-            while (_netAcc >= NetDt)
-            {
-                _netAcc -= NetDt;
-
-                StateList raw = _frameInput.Current;
-
-                StateList maskNet = BuildMaskNet(raw);
-                StateList moveMask = BuildMaskMovement(raw);
-
-                uint seq = _reconciler.NextSeq();
-                _reconciler.Record(seq, moveMask);
-
-                _networkManager.SendStateTick(maskNet, seq);
-            }
-
-            // ===== 7) apply reconcile sulla posizione locale =====
-            Vector2 p = _localPenguin.Position;
-            _reconciler.Apply(ref p, MoveSpeed, NetDt);
-            _localPenguin.Position = p;
-        }
-
-        base.Update(gameTime);
     }
 
-    private void TryConsumeJoinAckAndSpawn()
+    private void SendInputToServer(double nowSec)
     {
-        bool doSpawn;
-        uint pid;
-        Vector2 spawn;
+        if (!_spawned) return;
 
-        lock (_joinLock)
+        if (!_netInit)
         {
-            doSpawn = _pendingJoin;
-            pid = _pendingPlayerId;
-            spawn = _pendingSpawn;
-            _pendingJoin = false;
+            _netInit = true;
+            _nextNetTickSec = nowSec;
         }
 
-        if (!doSpawn || _spawned) return;
+        int maxTicksThisFrame = 5;
+        while (maxTicksThisFrame-- > 0 && nowSec >= _nextNetTickSec)
+        {
+            _nextNetTickSec += NetDt;
 
-        _playerId = pid;
+            StateList moveInput = GetMovementOnly(_frameInput.Current);
+            StateList actionInput = GetActionsOnly(_frameInput.Current);
 
-        _localPenguin = new NewPenguin(
-            Game,
-            spawn,
-            Vector2.Zero,
-            _animationManager,
-            _localController
-        );
+            uint sequence = _reconciler.NextSeq();
+            _reconciler.Record(sequence, moveInput);
 
-        // locale inoltra lo shot al server:
-        // shot è già (dx,dy,charge) perché NewPenguin costruisce l'offset prima di invocare l'evento
+            _networkManager.SendStateTick(moveInput | actionInput, sequence);
+        }
+    }
+
+    private void HandleSpawn(JoinSnapshot data)
+    {
+        _playerId = data.PlayerId;
+
+        _localPenguin = new NewPenguin(Game, data.SpawnPos, Vector2.Zero, _localAnimationManager, _localController);
         _localPenguin.OnShotReleased += shot => _networkManager.SendShot(shot);
 
         _obstacle = new Obstacle(Game, new Vector2(100, 100), 1, 1);
@@ -218,141 +174,70 @@ public sealed class GameSession : GameComponent, IDisposable
         OnEntitySpawned?.Invoke(_obstacle);
         OnEntitySpawned?.Invoke(_localPenguin);
 
-        _netAcc = 0f;
         _reconciler.Reset();
-
+        _netInit = false;
         _spawned = true;
     }
 
-    private void TryConsumeAuthAndFeedReconciler()
+    private void HandleRemoteUpdate(RemoteSnapshot data)
     {
-        bool has;
-        uint ack;
-        Vector2 pos;
-
-        lock (_authLock)
-        {
-            has = _pendingAuth;
-            ack = _pendingAck;
-            pos = _pendingAuthPos;
-            _pendingAuth = false;
-        }
-
-        if (!has) return;
-
-        _reconciler.OnServerAuth(ack, pos);
-    }
-
-    private void TryConsumeRemoteAndSpawnOrMove()
-    {
-        bool has;
-        Vector2 pos;
-        StateList mask;
-
-        lock (_remoteLock)
-        {
-            has = _pendingRemote;
-            pos = _pendingRemotePos;
-            mask = _pendingRemoteMask;
-            _pendingRemote = false;
-        }
-
-        if (!has || !_spawned) return;
-
-        // remoto deve ricevere anche Reload + Shoot
-        mask = BuildMask(mask,
+        StateList mask = FilterInput(
+            data.Mask,
             StateList.Up | StateList.Down | StateList.Left | StateList.Right |
             StateList.Reload | StateList.Shoot
         );
 
+        // remote is server-authoritative: snapshot position + mask for anim/shoot
         _remoteController.ApplyRemoteState(mask);
+        _remoteController.ApplyRemotePosition(data.Position);
 
         if (_remotePenguin == null)
         {
-            _remotePenguin = new NewPenguin(
-                Game,
-                pos,
-                Vector2.Zero,
-                _remoteAnimationManager,
-                _remoteController
-            );
-
+            _remotePenguin = new NewPenguin(Game, data.Position, Vector2.Zero, _remoteAnimationManager, _remoteController);
             OnEntitySpawned?.Invoke(_remotePenguin);
-            return;
         }
-
-        _remotePenguin.Position = pos;
     }
 
-    private void TryConsumeRemoteShotAndFeedController()
+    private void GetAll<T>(ConcurrentQueue<T> queue, Action<T> action)
     {
-        bool has;
-        int a, b;
-        float charge;
+        while (queue.TryDequeue(out T? item)) action(item);
+    }
 
-        lock (_shotLock)
+    private void GetLatest<T>(ConcurrentQueue<T> queue, Action<T> action)
+    {
+        T? latest = default;
+        bool hasData = false;
+
+        while (queue.TryDequeue(out T? item))
         {
-            has = _pendingRemoteShot;
-            a = _pendingShotA;
-            b = _pendingShotB;
-            charge = _pendingShotCharge;
-            _pendingRemoteShot = false;
+            latest = item;
+            hasData = true;
         }
 
-        if (!has) return;
-
-        // a,b = dx,dy offset (coerente con NewPenguin + server)
-        _remoteController.ApplyRemoteShot(a, b, charge);
+        if (hasData && latest != null) action(latest);
     }
 
-    private static StateList BuildMaskNet(StateList raw)
-    {
-        StateList m = raw & (
-            StateList.Up | StateList.Down | StateList.Left | StateList.Right |
-            StateList.Reload | StateList.Shoot
-        );
+    private StateList GetMovementOnly(StateList raw) =>
+        FilterInput(raw, StateList.Up | StateList.Down | StateList.Left | StateList.Right);
 
-        if ((m & StateList.Left) != 0 && (m & StateList.Right) != 0)
-            m &= ~(StateList.Left | StateList.Right);
+    private StateList GetActionsOnly(StateList raw) =>
+        FilterInput(raw, StateList.Reload | StateList.Shoot);
 
-        if ((m & StateList.Up) != 0 && (m & StateList.Down) != 0)
-            m &= ~(StateList.Up | StateList.Down);
-
-        return m;
-    }
-
-    private static StateList BuildMaskMovement(StateList raw)
-    {
-        StateList m = raw & (StateList.Up | StateList.Down | StateList.Left | StateList.Right);
-
-        if ((m & StateList.Left) != 0 && (m & StateList.Right) != 0)
-            m &= ~(StateList.Left | StateList.Right);
-
-        if ((m & StateList.Up) != 0 && (m & StateList.Down) != 0)
-            m &= ~(StateList.Up | StateList.Down);
-
-        return m;
-    }
-
-    private static StateList BuildMask(StateList raw, StateList allowed)
+    private static StateList FilterInput(StateList raw, StateList allowed)
     {
         StateList m = raw & allowed;
 
-        if ((m & StateList.Left) != 0 && (m & StateList.Right) != 0)
-            m &= ~(StateList.Left | StateList.Right);
-
-        if ((m & StateList.Up) != 0 && (m & StateList.Down) != 0)
-            m &= ~(StateList.Up | StateList.Down);
+        if ((m & StateList.Left) != 0 && (m & StateList.Right) != 0) m &= ~(StateList.Left | StateList.Right);
+        if ((m & StateList.Up) != 0 && (m & StateList.Down) != 0) m &= ~(StateList.Up | StateList.Down);
 
         return m;
     }
 
-    private void Stop()
+    public void Stop()
     {
         if (_localPenguin != null) OnEntityDestroyed?.Invoke(_localPenguin);
         if (_remotePenguin != null) OnEntityDestroyed?.Invoke(_remotePenguin);
         if (_obstacle != null) OnEntityDestroyed?.Invoke(_obstacle);
-
         OnEntityDestroyed?.Invoke(_collisionManager);
     }
 

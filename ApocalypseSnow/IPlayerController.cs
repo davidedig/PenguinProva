@@ -4,9 +4,9 @@ namespace ApocalypseSnow;
 
 public interface IPlayerController
 {
-    Vector2 GetMousePosition();
-    void UpdateInput(ref StateStruct inputList);
+    Vector2 ShootOffset { get; }
+    float ShotCharge { get; }
 
-    // 0..500 (stessa scala del tuo tiro)
-    float GetShotCharge();
+    void UpdateInput(ref StateStruct state);
+    void UpdatePosition(ref Vector2 position, float dt, in StateStruct state);
 }
